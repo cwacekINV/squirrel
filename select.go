@@ -14,7 +14,7 @@ type selectData struct {
 	Prefixes          exprs
 	Distinct          bool
 	Columns           []Sqlizer
-	From              string
+	FromPart          Sqlizer
 	Joins             []string
 	WhereParts        []Sqlizer
 	GroupBys          []string
@@ -22,7 +22,10 @@ type selectData struct {
 	OrderBys          []string
 	Limit             string
 	Offset            string
+	Union             []Sqlizer
+	UnionAll          []Sqlizer
 	Suffixes          exprs
+	As                string
 }
 
 func (d *selectData) Exec() (sql.Result, error) {
@@ -51,12 +54,30 @@ func (d *selectData) QueryRow() RowScanner {
 }
 
 func (d *selectData) ToSql() (sqlStr string, args []interface{}, err error) {
+	sqlStr, args, err = d.toSql(false)
+	if err != nil {
+		return
+	}
+
+	sqlStr, err = d.PlaceholderFormat.ReplacePlaceholders(sqlStr)
+	return
+}
+
+func (d *selectData) toSubQuerySql() (sqlStr string, args []interface{}, err error) {
+	return d.toSql(true)
+}
+
+func (d *selectData) toSql(subquery bool) (sqlStr string, args []interface{}, err error) {
 	if len(d.Columns) == 0 {
 		err = fmt.Errorf("select statements must have at least one result column")
 		return
 	}
 
 	sql := &bytes.Buffer{}
+
+	if subquery {
+		sql.WriteString("( ")
+	}
 
 	if len(d.Prefixes) > 0 {
 		args, _ = d.Prefixes.AppendToSql(sql, " ", args)
@@ -76,9 +97,12 @@ func (d *selectData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 	}
 
-	if len(d.From) > 0 {
+	if d.FromPart != nil {
 		sql.WriteString(" FROM ")
-		sql.WriteString(d.From)
+		args, err = appendToSql([]Sqlizer{d.FromPart}, sql, ", ", args)
+		if err != nil {
+			return
+		}
 	}
 
 	if len(d.Joins) > 0 {
@@ -127,7 +151,31 @@ func (d *selectData) ToSql() (sqlStr string, args []interface{}, err error) {
 		args, _ = d.Suffixes.AppendToSql(sql, " ", args)
 	}
 
-	sqlStr, err = d.PlaceholderFormat.ReplacePlaceholders(sql.String())
+	if len(d.Union) > 0 {
+		sql.WriteString(" UNION ")
+		args, err = appendToSql(d.Union, sql, " UNION ", args)
+		if err != nil {
+			return
+		}
+	}
+
+	if len(d.UnionAll) > 0 {
+		sql.WriteString(" UNION ALL ")
+		args, err = appendToSql(d.UnionAll, sql, " UNION ALL ", args)
+		if err != nil {
+			return
+		}
+	}
+
+	if subquery {
+		sql.WriteString(" )")
+		if len(d.As) != 0 {
+			sql.WriteString(" AS ")
+			sql.WriteString(d.As)
+		}
+	}
+
+	sqlStr = sql.String()
 	return
 }
 
@@ -214,8 +262,8 @@ func (b SelectBuilder) Column(column interface{}, args ...interface{}) SelectBui
 }
 
 // From sets the FROM clause of the query.
-func (b SelectBuilder) From(from string) SelectBuilder {
-	return builder.Set(b, "From", from).(SelectBuilder)
+func (b SelectBuilder) From(from interface{}) SelectBuilder {
+	return builder.Set(b, "FromPart", newFromPart(from)).(SelectBuilder)
 }
 
 // JoinClause adds a join clause to the query.
@@ -292,4 +340,14 @@ func (b SelectBuilder) Offset(offset uint64) SelectBuilder {
 // Suffix adds an expression to the end of the query
 func (b SelectBuilder) Suffix(sql string, args ...interface{}) SelectBuilder {
 	return builder.Append(b, "Suffixes", Expr(sql, args...)).(SelectBuilder)
+}
+
+// Union adds a UNION clause to the query
+func (b SelectBuilder) Union(query interface{}, args ...interface{}) SelectBuilder {
+	return builder.Append(b, "Union", newUnionPart(query, args...)).(SelectBuilder)
+}
+
+// UnionAll adds a UNION ALL clause to the query
+func (b SelectBuilder) UnionAll(query interface{}, args ...interface{}) SelectBuilder {
+	return builder.Append(b, "UnionAll", newUnionPart(query, args...)).(SelectBuilder)
 }
